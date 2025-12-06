@@ -1,0 +1,8 @@
+<RCC>
+    <qresource prefix="/qt/qml/rdc">
+        <file>main.qml</file>
+        <file>ConnectionDialog.qml</file>
+        <file>RemoteAppDialog.qml</file>
+        <file>RdpWindow.qml</file>
+    </qresource>
+</RCC>
