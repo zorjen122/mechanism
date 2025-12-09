@@ -59,6 +59,9 @@ Window {
             console.log("分辨率=" + desktopWidth + "x" + desktopHeight + ", 色彩深度=" + colorDepth)
             console.log("全屏=" + fullScreen + ", 音频=" + enableSound + ", 剪贴板=" + enableClipboard)
             
+            // 重要：禁用 RemoteApp 模式（桌面模式）
+            rdpClient.remoteAppMode = false
+            
             // 配置 RDP 客户端 - 基本设置
             rdpClient.server = ip
             rdpClient.port = port

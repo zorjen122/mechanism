@@ -17,7 +17,7 @@ Dialog {
     
     // 对外暴露的属性
     property string ip: ""
-    property int port: 3389
+    property int port: 8848
     property string username: ""
     property int desktopWidth: 1920
     property int desktopHeight: 1080

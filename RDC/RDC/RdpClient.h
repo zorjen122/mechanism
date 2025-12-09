@@ -99,6 +99,8 @@ public:
   void setArguments(const QString &args);
   void setExpandEnvVarInArguments(bool expand);
 
+  void __demo__();
+
 public slots:
   // RDP操作
   bool connectToServer();
@@ -137,6 +139,7 @@ private slots:
   void onDisconnected();
   void onLoginComplete();
   void onFatalError(int errorCode);
+  void onRemoteProgramResult(QString bstrExecutablePath, QVariant errorVariant, bool isExecutable);
 
 private:
   void initializeControl();

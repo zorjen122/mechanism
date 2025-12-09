@@ -2,6 +2,8 @@
 #include "RdpWindow.h"
 #include <QDebug>
 #include <QMessageBox>
+#include <QFileInfo>
+#include <QFile>
 
 RdpClient::RdpClient(QObject *parent)
     : QObject(parent), m_axWidget(nullptr), m_rdpClient(nullptr),
@@ -72,27 +74,19 @@ void RdpClient::initializeControl() {
   try {
     // 创建 MsTscAx ActiveX 控件
     // CLSID: {7390F3D8-0439-4C05-91E3-CF5CB290C3D0}
-    m_axWidget = new QAxWidget("7390F3D8-0439-4C05-91E3-CF5CB290C3D0");
+    m_axWidget = new QAxWidget("MsTscAx.MsTscAx");
 
     if (!m_axWidget) {
       qCritical() << "Failed to create RDP ActiveX control";
       emit connectionError(QString::fromUtf8("无法创建RDP控件"));
       return;
     }
-
-    // 尝试获取 IMsRdpClient10 接口
-    m_rdpClient = m_axWidget->querySubObject("IMsRdpClient10");
-
-    if (!m_rdpClient) {
-      qWarning() << "IMsRdpClient10 not available, trying IMsRdpClient9";
-      m_rdpClient = m_axWidget->querySubObject("IMsRdpClient9");
-    }
-
-    // 如果无法获取特定接口，直接使用 QAxWidget 的方法
-    // QAxWidget 本身就可以调用 COM 方法
+    
     if (!m_rdpClient) {
       qWarning() << "Using QAxWidget directly for COM calls";
     }
+    qDebug() << "QAxWidget interface COM ID: " << m_axWidget->control();
+	qDebug() << "RDP Control COM interface ID: " << (m_rdpClient ? m_rdpClient->control() : "Null");
 
     // 连接信号
     QObject::connect(m_axWidget, SIGNAL(OnConnected()), this,
@@ -103,6 +97,18 @@ void RdpClient::initializeControl() {
                      SLOT(onLoginComplete()));
     QObject::connect(m_axWidget, SIGNAL(OnFatalError(int)), this,
                      SLOT(onFatalError(int)));
+    
+    // 连接 RemoteApp 相关信号 - 使用正确的枚举类型
+    bool remoteProgramConnected = QObject::connect(m_axWidget, 
+        SIGNAL(OnRemoteProgramResult(QString, __MIDL___MIDL_itf_mstsax_0000_0059_0001, bool)), 
+        this, 
+        SLOT(onRemoteProgramResult(QString, QVariant, bool)));
+    
+    if (remoteProgramConnected) {
+        qDebug() << "OnRemoteProgramResult signal connected successfully";
+    } else {
+        qWarning() << "Failed to connect OnRemoteProgramResult signal";
+    }
 
     qDebug() << "RDP Control initialized successfully";
   } catch (...) {
@@ -235,8 +241,41 @@ bool RdpClient::connectToServer() {
   configureClient();
   
   // 如果是 RemoteApp 模式，配置 RemoteApp
-  if (m_remoteAppMode) 
+  if (m_remoteAppMode) {
+      qDebug() << "Connecting in RemoteApp mode";
       configureRemoteApp();
+      // 如果是 RemoteApp 模式，在登录完成后启动应用
+      if (!m_remoteProgram) {
+          qCritical() << "Cannot get RemoteProgram object - RemoteApp not supported";
+          emit remoteAppError(QString::fromUtf8(
+              "无法获取RemoteProgram对象\n\n"
+              "此RDP客户端版本可能不支持RemoteApp功能。\n"
+              "建议使用 .rdp 文件方式或 mstsc.exe。"
+          ));
+          return false;
+      }
+      
+      // 注意：不在这里启动 RemoteApp，而是在 onLoginComplete() 中启动
+  } else {
+      // 桌面模式：确保 RemoteApp 模式被禁用
+      qDebug() << "Connecting in Desktop mode";
+      QAxBase* rdpControl = getRdpControl();
+      if (rdpControl) {
+          QAxObject* remoteProgram = rdpControl->querySubObject("RemoteProgram2");
+          if (!remoteProgram) {
+              remoteProgram = rdpControl->querySubObject("RemoteProgram");
+          }
+          if (remoteProgram) {
+              try {
+                  remoteProgram->setProperty("RemoteProgramMode", false);
+                  qDebug() << "RemoteProgramMode disabled for Desktop mode";
+                  delete remoteProgram;
+              } catch (...) {
+                  qWarning() << "Exception while disabling RemoteApp mode";
+              }
+          }
+      }
+  }
 
   // 创建并显示 RDP 窗口
   if (!m_rdpWindow) {
@@ -382,14 +421,26 @@ void RdpClient::onDisconnected() {
   m_connected = false;
   emit connectedChanged();
   qDebug() << "RDP Disconnected";
+  
+  // 断开连接后清理 RemoteApp 状态
+  if (m_remoteProgram) {
+    try {
+      // 禁用 RemoteApp 模式
+      m_remoteProgram->setProperty("RemoteProgramMode", false);
+    } catch (...) {
+      qWarning() << "Exception while disabling RemoteApp mode";
+    }
+    delete m_remoteProgram;
+    m_remoteProgram = nullptr;
+  }
 }
 
 void RdpClient::onLoginComplete() { 
   qDebug() << "RDP Login completed";
   
   // 如果是 RemoteApp 模式，在登录完成后启动应用
-  if (m_remoteAppMode) {
-    qDebug() << "Starting RemoteApp after login...";
+  if (m_remoteAppMode && m_remoteProgram) {
+    qDebug() << "Login complete, starting RemoteApp...";
     startRemoteApp();
   }
 }
@@ -411,25 +462,42 @@ void RdpClient::configureRemoteApp() {
     qDebug() << "========== Configuring RemoteApp ==========";
     try
     {
+        // 尝试获取 RemoteProgram2 接口（更新版本）
         m_remoteProgram = rdpControl->querySubObject("RemoteProgram2");
         if (!m_remoteProgram)
         {
-            qDebug() << "Failed to get RemoteProgram2 interface.";
+            qDebug() << "Failed to get RemoteProgram2 interface, trying RemoteProgram...";
             m_remoteProgram = rdpControl->querySubObject("RemoteProgram");
             if (!m_remoteProgram)
             {
+                qCritical() << "Failed to get RemoteProgram interface";
                 emit remoteAppError(QString::fromUtf8(
                     "无法获取 RemoteProgram 接口。\n\n"
                     "此 RDP 客户端版本可能不支持 RemoteApp 功能。\n"
                     "建议使用 .rdp 文件方式或 mstsc.exe。"
                 ));
+                return;
             }
         }
-    }catch(...)
-    {
-        qDebug() << "Exception occurred while getting RemoteProgram interface.";
+        
+        qDebug() << "RemoteProgram interface obtained successfully";
+        
+        // 启用 RemoteApp 模式
+        m_remoteProgram->setProperty("RemoteProgramMode", true);
+        
+        // 验证模式是否设置成功
+        bool modeSet = m_remoteProgram->property("RemoteProgramMode").toBool();
+        qDebug() << "RemoteProgramMode set to:" << modeSet;
+        
+        if (!modeSet) {
+            qCritical() << "Failed to enable RemoteProgramMode";
+            emit remoteAppError(QString::fromUtf8("无法启用 RemoteApp 模式"));
+        }
+
+    } catch(...) {
+        qCritical() << "Exception occurred while configuring RemoteApp";
         emit remoteAppError(QString::fromUtf8(
-            "获取 RemoteProgram 接口时发生异常。\n\n"
+            "配置 RemoteApp 时发生异常。\n\n"
             "此 RDP 客户端版本可能不支持 RemoteApp 功能。\n"
             "建议使用 .rdp 文件方式或 mstsc.exe。"
         ));
@@ -438,98 +506,46 @@ void RdpClient::configureRemoteApp() {
 
 // Start RemoteApp after login
 void RdpClient::startRemoteApp() {
+  if (!m_remoteProgram) {
+    qCritical() << "RemoteProgram object not initialized";
+    emit remoteAppError(QString::fromUtf8("RemoteProgram对象未初始化"));
+    return;
+  }
+  
   if (m_executablePath.isEmpty()) {
     qCritical() << "Executable path is empty";
     emit remoteAppError(QString::fromUtf8("可执行文件路径不能为空"));
     return;
   }
-
+  
+  qDebug() << "========== Starting RemoteApp ==========";
+  qDebug() << "  Executable:" << m_executablePath;
+  qDebug() << "  File:" << m_filePath;
+  qDebug() << "  WorkDir:" << m_workingDirectory;
+  qDebug() << "  ExpandWorkDir:" << m_expandEnvVarInWorkingDirectory;
+  qDebug() << "  Arguments:" << m_arguments;
+  qDebug() << "  ExpandArgs:" << m_expandEnvVarInArguments;
+  qDebug() << "========================================";
+  
   try {
-    qDebug() << "========== Starting RemoteApp ==========";
-    qDebug() << "  Executable:" << m_executablePath;
-    qDebug() << "  File:" << m_filePath;
-    qDebug() << "  WorkDir:" << m_workingDirectory;
-    qDebug() << "  ExpandWorkDir:" << m_expandEnvVarInWorkingDirectory;
-    qDebug() << "  Arguments:" << m_arguments;
-    qDebug() << "  ExpandArgs:" << m_expandEnvVarInArguments;
-    qDebug() << "========================================";
-    
-    if (!m_remoteProgram) {
-      qCritical() << "Cannot get RemoteProgram object - RemoteApp not supported";
-      emit remoteAppError(QString::fromUtf8(
-        "无法获取RemoteProgram对象\n\n"
-        "此RDP客户端版本可能不支持RemoteApp功能。\n"
-        "建议使用 .rdp 文件方式或 mstsc.exe。"
-      ));
-      return;
-    }
-    
-    qDebug() << "Using RemoteProgram object:" << m_remoteProgram;
-    
-    bool success = false;
-    QString lastError;
-    
-    // 方式1: 标准 ServerStartProgram 调用
-    qDebug() << "Attempt 1: ServerStartProgram(QString, ...)...";
-    try {
-      m_remoteProgram->dynamicCall(
+    // 使用 ServerStartProgram 方法启动 RemoteApp
+    // 参数：可执行文件路径、文件路径、工作目录、是否展开工作目录环境变量、参数、是否展开参数环境变量
+    m_remoteProgram->dynamicCall(
         "ServerStartProgram(QString, QString, QString, bool, QString, bool)",
         m_executablePath,
-        m_filePath.isEmpty() ? QString("") : m_filePath,
-        m_workingDirectory.isEmpty() ? QString("") : m_workingDirectory,
+        m_filePath,
+        m_workingDirectory,
         m_expandEnvVarInWorkingDirectory,
-        m_arguments.isEmpty() ? QString("") : m_arguments,
+        m_arguments,
         m_expandEnvVarInArguments
-      );
-      success = true;
-      qDebug() << "Success: ServerStartProgram called!";
-    } catch (const std::exception &e) {
-      lastError = QString("ServerStartProgram failed: ") + e.what();
-      qWarning() << lastError;
-    } catch (...) {
-      lastError = "ServerStartProgram failed with unknown exception";
-      qWarning() << lastError;
-    }
+    );
     
-    // 方式2: 使用 BSTR 类型
-    if (!success) {
-      qDebug() << "Attempt 2: ServerStartProgram(BSTR, ...)...";
-      try {
-        m_remoteProgram->dynamicCall(
-          "ServerStartProgram(BSTR, BSTR, BSTR, VARIANT_BOOL, BSTR, VARIANT_BOOL)",
-          m_executablePath,
-          m_filePath,
-          m_workingDirectory,
-          m_expandEnvVarInWorkingDirectory,
-          m_arguments,
-          m_expandEnvVarInArguments
-        );
-        success = true;
-        qDebug() << "Success: ServerStartProgram (BSTR) called!";
-      } catch (const std::exception &e) {
-        lastError = QString("ServerStartProgram (BSTR) failed: ") + e.what();
-        qWarning() << lastError;
-      } catch (...) {
-        lastError = "ServerStartProgram (BSTR) failed";
-        qWarning() << lastError;
-      }
-    }
-
-    if (success) {
-      qDebug() << "========== RemoteApp Started ==========";
-      emit remoteAppStarted();
-    } else {
-      qCritical() << "========== All attempts failed ==========";
-      qCritical() << "Last error:" << lastError;
-      emit remoteAppError(QString::fromUtf8("调用ServerStartProgram失败\n\n") + lastError);
-    }
+    qDebug() << "ServerStartProgram called successfully";
+    emit remoteAppStarted();
     
-  } catch (const std::exception &e) {
-    qCritical() << "Exception occurred while starting RemoteApp:" << e.what();
-    emit remoteAppError(QString::fromUtf8("启动RemoteApp时发生异常: ") + e.what());
   } catch (...) {
-    qCritical() << "Unknown exception occurred while starting RemoteApp";
-    emit remoteAppError(QString::fromUtf8("启动RemoteApp时发生未知异常"));
+    qCritical() << "Exception occurred while starting RemoteApp";
+    emit remoteAppError(QString::fromUtf8("启动RemoteApp时发生异常"));
   }
 }
 
@@ -581,4 +597,30 @@ void RdpClient::setExpandEnvVarInArguments(bool expand) {
     m_expandEnvVarInArguments = expand;
     emit expandEnvVarInArgumentsChanged();
   }
+}
+
+
+void RdpClient::__demo__() {
+    qDebug() << "init";
+    initializeControl();
+
+    bool ok = connectToServer();
+}
+void RdpClient::onRemoteProgramResult(QString bstrExecutablePath, QVariant errorVariant, bool isExecutable) {
+    int error = errorVariant.toInt();
+    qDebug() << "========== RemoteApp 启动结果 ==========";
+    qDebug() << "程序路径:" << bstrExecutablePath;
+    qDebug() << "是否可执行:" << isExecutable;
+    qDebug() << "原始错误码(Int):" << error;
+
+    // 根据微软文档解析错误码 (RailResult 枚举)
+    switch (error) {
+    case 0: qDebug() << "结果: 成功 (RAIL_RESULT_NO_ERROR)"; break;
+    case 1: qDebug() << "结果: 错误 - 参数校验失败"; break;
+    case 2: qDebug() << "结果: 错误 - 无效的执行路径"; break;
+    case 3: qDebug() << "结果: 错误 - 文件未找到 (通常是路径不对)"; break;
+    case 4: qDebug() << "结果: 错误 - 内部错误"; break;
+    case 5: qDebug() << "结果: 错误 - 拒绝访问 (通常是服务端注册表没开白名单)"; break;
+    default: qDebug() << "结果: 未知错误"; break;
+    }
 }

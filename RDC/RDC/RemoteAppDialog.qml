@@ -16,12 +16,12 @@ Dialog {
     y: (parent.height - height) / 2
     
     // 对外暴露的属性 - 连接设置
-    property string ip: ""
-    property int port: 3389
-    property string username: ""
+    property string ip: "192.168.10.9"
+    property int port: 8848
+    property string username: "Administrator"
     
     // RemoteApp 参数
-    property string executablePath: ""
+    property string executablePath: "C:\\Windows\\explorer.exe"
     property string filePath: ""
     property string workingDirectory: ""
     property bool expandEnvVarInWorkingDirectory: false
